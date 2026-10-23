@@ -1,5 +1,6 @@
 import '@tanstack/react-start/server-only'
 
+import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import {
   AuthConfigurationError,
@@ -33,6 +34,32 @@ const loginAttempts = new Map<string, { count: number; resetAt: number }>()
 const LOGIN_WINDOW_MS = 15 * 60 * 1000
 const LOGIN_ATTEMPT_LIMIT = 5
 const productionLoginRateLimit = createVercelAdminLoginRateLimiter()
+
+type LoginDiagnosticStage =
+  | 'authentication_configuration'
+  | 'rate_limit'
+  | 'credential_verification'
+  | 'session_creation'
+
+const SAFE_ERROR_NAMES = new Set([
+  'AggregateError',
+  'AuthConfigurationError',
+  'Error',
+  'MongoAPIError',
+  'MongoAuthenticationError',
+  'MongoDatabaseUnavailableError',
+  'MongoNetworkError',
+  'MongoParseError',
+  'MongoRuntimeError',
+  'MongoServerError',
+  'MongoServerSelectionError',
+  'RangeError',
+  'ReferenceError',
+  'SyntaxError',
+  'TimeoutError',
+  'TypeError',
+  'URIError',
+])
 
 function getProductionContext(): AuthRouteContext {
   const config = getAuthConfig()
@@ -74,6 +101,8 @@ export function createAuthRouteHandlers(
   rateLimit: RateLimit = rateLimitLogin,
 ) {
   async function login(request: Request): Promise<Response> {
+    const requestId = randomUUID()
+    let stage: LoginDiagnosticStage = 'authentication_configuration'
     try {
       const { config, authentication } = getContext()
       if (request.method !== 'POST') return authError(405, 'method_not_allowed')
@@ -89,22 +118,21 @@ export function createAuthRouteHandlers(
       }
       const input = loginSchema.safeParse(rawInput)
       if (!input.success) return authError(400, 'invalid_request')
+
+      stage = 'rate_limit'
       if (!(await rateLimit(request, input.data.email))) {
         return authError(429, 'login_unavailable')
       }
 
-      let sessionVersion: string | null
-      try {
-        sessionVersion = await verifyCredentials(
-          input.data.email,
-          input.data.password,
-        )
-      } catch {
-        return authError(503, 'authentication_unavailable')
-      }
+      stage = 'credential_verification'
+      const sessionVersion = await verifyCredentials(
+        input.data.email,
+        input.data.password,
+      )
       if (!sessionVersion) return authError(401, 'invalid_credentials')
 
       clearLoginAttempts(input.data.email)
+      stage = 'session_creation'
       const cookies = await authentication.createSession(
         input.data.email,
         sessionVersion,
@@ -117,6 +145,7 @@ export function createAuthRouteHandlers(
       response.headers.append('Set-Cookie', cookies.csrfCookie)
       return response
     } catch (error) {
+      logLoginFailure(requestId, stage, error)
       if (error instanceof AuthConfigurationError) {
         return authError(503, 'configuration_error', {
           missing: error.missing,
@@ -160,6 +189,23 @@ export function createAuthRouteHandlers(
   }
 
   return { login, logout }
+}
+
+function logLoginFailure(
+  requestId: string,
+  stage: LoginDiagnosticStage,
+  error: unknown,
+): void {
+  const errorName =
+    error instanceof Error && SAFE_ERROR_NAMES.has(error.name)
+      ? error.name
+      : 'Error'
+  const errorCategory =
+    error instanceof AuthConfigurationError ? 'configuration' : 'unexpected'
+  console.error(
+    '[auth-login] request failed',
+    JSON.stringify({ requestId, stage, errorCategory, errorName }),
+  )
 }
 
 function authError(

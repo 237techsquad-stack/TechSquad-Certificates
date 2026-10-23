@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
 import test from 'node:test'
 import {
+  AuthConfigurationError,
   createAuthentication,
   parseAuthConfig,
 } from '../src/lib/auth.server.ts'
@@ -139,5 +140,140 @@ test('missing auth configuration reports only required variable names', async ()
     else process.env.APP_ORIGIN = previousOrigin
     if (previousEnvironment === undefined) delete process.env.NODE_ENV
     else process.env.NODE_ENV = previousEnvironment
+  }
+})
+
+test('login failures log one sanitized correlation diagnostic and preserve 503 responses', async () => {
+  const diagnostics: string[][] = []
+  const originalConsoleError = console.error
+  console.error = (...args: Parameters<typeof console.error>) => {
+    diagnostics.push(args.map((value) => String(value)))
+  }
+
+  try {
+    const config = parseAuthConfig(environment)
+    const requestIds = new Set<string>()
+    const failure = (name: string) => {
+      const error = new Error('private credential and connection detail')
+      error.name = name
+      return error
+    }
+    const cases = [
+      {
+        stage: 'rate_limit',
+        getContext: () => ({
+          config,
+          authentication: createAuthentication(config, async () => true),
+        }),
+        verify: async () => randomBytes(32).toString('base64url'),
+        rateLimit: async () => {
+          throw failure('private error name')
+        },
+        expectedName: 'Error',
+      },
+      {
+        stage: 'credential_verification',
+        getContext: () => ({
+          config,
+          authentication: createAuthentication(config, async () => true),
+        }),
+        verify: async () => {
+          throw failure('MongoServerSelectionError')
+        },
+        rateLimit: async () => true,
+        expectedName: 'MongoServerSelectionError',
+      },
+      {
+        stage: 'session_creation',
+        getContext: () => {
+          const authentication = createAuthentication(config, async () => true)
+          authentication.createSession = async () => {
+            throw failure('TypeError')
+          }
+          return { config, authentication }
+        },
+        verify: async () => randomBytes(32).toString('base64url'),
+        rateLimit: async () => true,
+        expectedName: 'TypeError',
+      },
+    ] as const
+
+    const requestBody = {
+      email: 'admin@example.test',
+      password: 'private-login-password',
+    }
+
+    for (const testCase of cases) {
+      diagnostics.length = 0
+      const handler = createAuthRouteHandlers(
+        testCase.getContext,
+        testCase.verify,
+        testCase.rateLimit,
+      )
+      const response = await handler.login(
+        loginRequest(environment.APP_ORIGIN, requestBody),
+      )
+      assert.equal(response.status, 503)
+      assert.deepEqual(await response.json(), {
+        error: 'authentication_unavailable',
+      })
+      assert.equal(diagnostics.length, 1)
+      assert.equal(diagnostics[0]?.[0], '[auth-login] request failed')
+      const details = JSON.parse(diagnostics[0]?.[1] ?? '{}') as {
+        requestId: string
+        stage: string
+        errorCategory: string
+        errorName: string
+      }
+      assert.match(details.requestId, /^[0-9a-f-]{36}$/)
+      requestIds.add(details.requestId)
+      assert.equal(details.stage, testCase.stage)
+      assert.equal(details.errorCategory, 'unexpected')
+      assert.equal(details.errorName, testCase.expectedName)
+      const loggedText = diagnostics[0]?.join(' ') ?? ''
+      assert.doesNotMatch(
+        loggedText,
+        /private credential|connection detail|private-login-password|admin@example\.test/,
+      )
+    }
+
+    diagnostics.length = 0
+    const configurationHandler = createAuthRouteHandlers(
+      () => {
+        throw new AuthConfigurationError(['AUTH_SESSION_KEY'], [])
+      },
+      async () => randomBytes(32).toString('base64url'),
+      async () => true,
+    )
+    const configurationResponse = await configurationHandler.login(
+      loginRequest(environment.APP_ORIGIN, requestBody),
+    )
+    assert.equal(configurationResponse.status, 503)
+    assert.deepEqual(await configurationResponse.json(), {
+      error: 'configuration_error',
+      missing: ['AUTH_SESSION_KEY'],
+      invalid: [],
+    })
+    assert.equal(diagnostics.length, 1)
+    const configurationDetails = JSON.parse(
+      diagnostics[0]?.[1] ?? '{}',
+    ) as Record<string, unknown>
+    assert.match(String(configurationDetails.requestId), /^[0-9a-f-]{36}$/)
+    requestIds.add(String(configurationDetails.requestId))
+    assert.equal(requestIds.size, 4)
+    assert.deepEqual(
+      {
+        stage: configurationDetails.stage,
+        errorCategory: configurationDetails.errorCategory,
+        errorName: configurationDetails.errorName,
+      },
+      {
+        stage: 'authentication_configuration',
+        errorCategory: 'configuration',
+        errorName: 'AuthConfigurationError',
+      },
+    )
+  } finally {
+    console.error = originalConsoleError
   }
 })
