@@ -158,10 +158,11 @@ export function createAuthRouteHandlers(
         requestId = createFallbackRequestId()
       }
       logLoginFailure(requestId, stage, error)
-      if (error instanceof AuthConfigurationError) {
+      const configurationDetails = getSafeAuthConfigurationDetails(error)
+      if (configurationDetails) {
         return authError(503, 'configuration_error', {
-          missing: error.missing,
-          invalid: error.invalid,
+          missing: configurationDetails.missing,
+          invalid: configurationDetails.invalid,
         })
       }
       return authError(503, 'authentication_unavailable')
@@ -216,17 +217,13 @@ function logLoginFailure(
   stage: LoginDiagnosticStage,
   error: unknown,
 ): void {
-  const safeRequestId =
-    requestId && /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|[0-9a-f]{32})$/i.test(requestId)
-      ? requestId
-      : null
-  const errorName =
-    error instanceof Error && SAFE_ERROR_NAMES.has(error.name)
-      ? error.name
-      : 'Error'
-  const errorCategory =
-    error instanceof AuthConfigurationError ? 'configuration' : 'unexpected'
   try {
+    const safeRequestId =
+      requestId && /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|[0-9a-f]{32})$/i.test(requestId)
+        ? requestId
+        : null
+    const errorName = getSafeErrorName(error)
+    const errorCategory = getSafeErrorCategory(error)
     console.error(
       '[auth-login] request failed',
       JSON.stringify({
@@ -238,6 +235,41 @@ function logLoginFailure(
     )
   } catch {
     // Preserve the generic failure response if the runtime logger is unavailable.
+  }
+}
+
+function getSafeErrorName(error: unknown): string {
+  try {
+    if (!(error instanceof Error)) return 'Error'
+    const name = error.name
+    return typeof name === 'string' && SAFE_ERROR_NAMES.has(name)
+      ? name
+      : 'Error'
+  } catch {
+    return 'Error'
+  }
+}
+
+function getSafeErrorCategory(
+  error: unknown,
+): 'configuration' | 'unexpected' {
+  try {
+    return error instanceof AuthConfigurationError
+      ? 'configuration'
+      : 'unexpected'
+  } catch {
+    return 'unexpected'
+  }
+}
+
+function getSafeAuthConfigurationDetails(
+  error: unknown,
+): { missing: readonly string[]; invalid: readonly string[] } | null {
+  try {
+    if (!(error instanceof AuthConfigurationError)) return null
+    return { missing: error.missing, invalid: error.invalid }
+  } catch {
+    return null
   }
 }
 

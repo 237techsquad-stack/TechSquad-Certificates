@@ -345,3 +345,66 @@ test('request ID generation failure uses a random fallback and returns one gener
     console.error = originalConsoleError
   }
 })
+
+test('diagnostic inspection failures cannot escape login error handling', async () => {
+  const diagnostics: string[][] = []
+  const originalConsoleError = console.error
+  console.error = (...args: Parameters<typeof console.error>) => {
+    diagnostics.push(args.map((value) => String(value)))
+  }
+
+  try {
+    const config = parseAuthConfig(environment)
+    const authentication = createAuthentication(config, async () => true)
+    const throwingName = new Error('private raw error detail')
+    Object.defineProperty(throwingName, 'name', {
+      get() {
+        throw new Error('private name getter detail')
+      },
+    })
+    const hostileProxy = new Proxy(
+      {},
+      {
+        getPrototypeOf() {
+          throw new Error('private proxy inspection detail')
+        },
+      },
+    )
+    const errors: unknown[] = [throwingName, hostileProxy]
+
+    for (const error of errors) {
+      diagnostics.length = 0
+      const handler = createAuthRouteHandlers(
+        () => ({ config, authentication }),
+        async () => {
+          throw error
+        },
+        async () => true,
+      )
+      const response = await handler.login(loginRequest())
+
+      assert.equal(response.status, 503)
+      assert.deepEqual(await response.json(), {
+        error: 'authentication_unavailable',
+      })
+      assert.equal(diagnostics.length, 1)
+      assert.equal(diagnostics[0]?.[0], '[auth-login] request failed')
+      const loggedDetails = JSON.parse(diagnostics[0]?.[1] ?? '{}') as {
+        requestId: string
+        stage: string
+        errorCategory: string
+        errorName: string
+      }
+      assert.match(loggedDetails.requestId, /^[0-9a-f-]{36}$/)
+      assert.equal(loggedDetails.stage, 'credential_verification')
+      assert.equal(loggedDetails.errorCategory, 'unexpected')
+      assert.equal(loggedDetails.errorName, 'Error')
+      assert.doesNotMatch(
+        diagnostics[0]?.join(' ') ?? '',
+        /private raw error detail|private name getter detail|private proxy inspection detail/,
+      )
+    }
+  } finally {
+    console.error = originalConsoleError
+  }
+})
