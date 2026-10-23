@@ -1,6 +1,6 @@
 import '@tanstack/react-start/server-only'
 
-import { randomUUID } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import {
   AuthConfigurationError,
@@ -24,6 +24,7 @@ type VerifyCredentials = (
   password: string,
 ) => Promise<string | null>
 type RateLimit = (request: Request, email: string) => Promise<boolean>
+type CreateRequestId = () => string
 
 const loginSchema = z.object({
   email: z.string().trim().toLowerCase().email().max(320),
@@ -36,6 +37,7 @@ const LOGIN_ATTEMPT_LIMIT = 5
 const productionLoginRateLimit = createVercelAdminLoginRateLimiter()
 
 type LoginDiagnosticStage =
+  | 'request_id_generation'
   | 'authentication_configuration'
   | 'rate_limit'
   | 'credential_verification'
@@ -99,11 +101,18 @@ export function createAuthRouteHandlers(
   getContext: GetAuthRouteContext = getProductionContext,
   verifyCredentials: VerifyCredentials = verifyPrimaryAdminCredentials,
   rateLimit: RateLimit = rateLimitLogin,
+  createRequestId: CreateRequestId = randomUUID,
 ) {
   async function login(request: Request): Promise<Response> {
-    const requestId = randomUUID()
-    let stage: LoginDiagnosticStage = 'authentication_configuration'
+    let requestId: string | null = null
+    let stage: LoginDiagnosticStage = 'request_id_generation'
     try {
+      const generatedRequestId = createRequestId()
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(generatedRequestId)) {
+        throw new Error('Invalid request identifier')
+      }
+      requestId = generatedRequestId
+      stage = 'authentication_configuration'
       const { config, authentication } = getContext()
       if (request.method !== 'POST') return authError(405, 'method_not_allowed')
       if (request.headers.get('origin') !== config.appOrigin) {
@@ -145,6 +154,9 @@ export function createAuthRouteHandlers(
       response.headers.append('Set-Cookie', cookies.csrfCookie)
       return response
     } catch (error) {
+      if (stage === 'request_id_generation') {
+        requestId = createFallbackRequestId()
+      }
       logLoginFailure(requestId, stage, error)
       if (error instanceof AuthConfigurationError) {
         return authError(503, 'configuration_error', {
@@ -191,21 +203,42 @@ export function createAuthRouteHandlers(
   return { login, logout }
 }
 
+function createFallbackRequestId(): string | null {
+  try {
+    return randomBytes(16).toString('hex')
+  } catch {
+    return null
+  }
+}
+
 function logLoginFailure(
-  requestId: string,
+  requestId: string | null,
   stage: LoginDiagnosticStage,
   error: unknown,
 ): void {
+  const safeRequestId =
+    requestId && /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|[0-9a-f]{32})$/i.test(requestId)
+      ? requestId
+      : null
   const errorName =
     error instanceof Error && SAFE_ERROR_NAMES.has(error.name)
       ? error.name
       : 'Error'
   const errorCategory =
     error instanceof AuthConfigurationError ? 'configuration' : 'unexpected'
-  console.error(
-    '[auth-login] request failed',
-    JSON.stringify({ requestId, stage, errorCategory, errorName }),
-  )
+  try {
+    console.error(
+      '[auth-login] request failed',
+      JSON.stringify({
+        requestId: safeRequestId,
+        stage,
+        errorCategory,
+        errorName,
+      }),
+    )
+  } catch {
+    // Preserve the generic failure response if the runtime logger is unavailable.
+  }
 }
 
 function authError(

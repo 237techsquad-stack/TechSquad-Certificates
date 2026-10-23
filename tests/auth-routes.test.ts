@@ -277,3 +277,71 @@ test('login failures log one sanitized correlation diagnostic and preserve 503 r
     console.error = originalConsoleError
   }
 })
+
+test('request ID generation failure uses a random fallback and returns one generic 503', async () => {
+  const diagnostics: string[][] = []
+  const originalConsoleError = console.error
+  const consoleError = (...args: Parameters<typeof console.error>) => {
+    diagnostics.push(args.map((value) => String(value)))
+  }
+  console.error = consoleError
+
+  try {
+    const config = parseAuthConfig(environment)
+    let contextCalls = 0
+    let rateLimitCalls = 0
+    let credentialCalls = 0
+    const authentication = createAuthentication(config, async () => true)
+    const handler = createAuthRouteHandlers(
+      () => {
+        contextCalls += 1
+        return { config, authentication }
+      },
+      async () => {
+        credentialCalls += 1
+        return randomBytes(32).toString('base64url')
+      },
+      async () => {
+        rateLimitCalls += 1
+        return true
+      },
+      () => {
+        throw new Error('private identifier-generation detail')
+      },
+    )
+
+    const fallbackIds = new Set<string>()
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      diagnostics.length = 0
+      const response = await handler.login(loginRequest())
+      assert.equal(response.status, 503)
+      assert.deepEqual(await response.json(), {
+        error: 'authentication_unavailable',
+      })
+      assert.equal(diagnostics.length, 1)
+      assert.equal(diagnostics[0]?.[0], '[auth-login] request failed')
+      const loggedDetails = JSON.parse(diagnostics[0]?.[1] ?? '{}') as {
+        requestId: string | null
+        stage: string
+        errorCategory: string
+        errorName: string
+      }
+      assert.match(loggedDetails.requestId ?? '', /^[0-9a-f]{32}$/)
+      fallbackIds.add(loggedDetails.requestId ?? '')
+      assert.equal(loggedDetails.stage, 'request_id_generation')
+      assert.equal(loggedDetails.errorCategory, 'unexpected')
+      assert.equal(loggedDetails.errorName, 'Error')
+      assert.doesNotMatch(
+        diagnostics[0]?.join(' ') ?? '',
+        /private identifier-generation detail|admin@example\.test/,
+      )
+    }
+
+    assert.equal(fallbackIds.size, 2)
+    assert.equal(contextCalls, 0)
+    assert.equal(rateLimitCalls, 0)
+    assert.equal(credentialCalls, 0)
+  } finally {
+    console.error = originalConsoleError
+  }
+})
