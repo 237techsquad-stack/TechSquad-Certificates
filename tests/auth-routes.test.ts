@@ -87,6 +87,47 @@ test('cross-origin login requests, invalid bodies, and excessive attempts are re
   assert.equal((await limited.handlers.login(loginRequest())).status, 429)
 })
 
+test('production login uses the local throttle and clears it after successful authentication', async () => {
+  const previousNodeEnv = process.env.NODE_ENV
+  const previousVercel = process.env.VERCEL
+  process.env.NODE_ENV = 'production'
+  delete process.env.VERCEL
+
+  try {
+    const config = parseAuthConfig(environment)
+    const authentication = createAuthentication(config, async () => true)
+    const email = `admin-${randomBytes(8).toString('hex')}@example.test`
+    let credentialsValid = false
+    const handler = createAuthRouteHandlers(
+      () => ({ config, authentication }),
+      async () =>
+        credentialsValid ? randomBytes(32).toString('base64url') : null,
+    )
+    const request = () =>
+      loginRequest(environment.APP_ORIGIN, {
+        email,
+        password: randomBytes(24).toString('base64url'),
+      })
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      assert.equal((await handler.login(request())).status, 401)
+    }
+    credentialsValid = true
+    assert.equal((await handler.login(request())).status, 200)
+    credentialsValid = false
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      assert.equal((await handler.login(request())).status, 401)
+    }
+    assert.equal((await handler.login(request())).status, 429)
+  } finally {
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV
+    else process.env.NODE_ENV = previousNodeEnv
+    if (previousVercel === undefined) delete process.env.VERCEL
+    else process.env.VERCEL = previousVercel
+  }
+})
+
 test('logout requires a valid session, exact-origin CSRF token, and clears both cookies', async () => {
   const { config, authentication, handlers } = setup()
   const session = await authentication.createSession(

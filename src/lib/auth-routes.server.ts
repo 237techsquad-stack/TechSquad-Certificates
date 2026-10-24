@@ -10,7 +10,6 @@ import {
 } from './auth.server.ts'
 import type { AuthConfig } from './auth.server.ts'
 import { verifyPrimaryAdminCredentials } from './admin-credentials.server.ts'
-import { createVercelAdminLoginRateLimiter } from './verification-rate-limit.server.ts'
 
 type Authentication = ReturnType<typeof createAuthentication>
 type AuthRouteContext = {
@@ -34,7 +33,6 @@ const loginSchema = z.object({
 const loginAttempts = new Map<string, { count: number; resetAt: number }>()
 const LOGIN_WINDOW_MS = 15 * 60 * 1000
 const LOGIN_ATTEMPT_LIMIT = 5
-const productionLoginRateLimit = createVercelAdminLoginRateLimiter()
 
 type LoginDiagnosticStage =
   | 'request_id_generation'
@@ -86,10 +84,7 @@ function allowLocalLoginAttempt(email: string): boolean {
   return true
 }
 
-async function rateLimitLogin(request: Request, email: string): Promise<boolean> {
-  if (process.env.NODE_ENV === 'production') {
-    return productionLoginRateLimit(request)
-  }
+async function rateLimitLogin(_request: Request, email: string): Promise<boolean> {
   return allowLocalLoginAttempt(email)
 }
 
